@@ -1,7 +1,12 @@
 import os
 import socket
+import sys
+import typing
+from dataclasses import dataclass
+from functools import wraps
 from io import BytesIO
 from pprint import pprint
+from time import sleep
 from urllib.parse import urlparse
 
 from icyripper.buffer import ByteFifo
@@ -23,57 +28,118 @@ class ShouldNeverHappenException(BaseException):
     pass
 
 
-def parse_url(url):
-    parsed = urlparse(url)
+@dataclass
+class RipperContext:
+    song_store: BytesIO
+    song_bytes_to_read: int
+    song_chunk_size: int
+    content_type: str
 
-    if ':' in parsed.netloc:
-        host, port = parsed.netloc.split(':')
-        port = int(port)
-    else:
-        host = parsed.netloc
-        port = 80
-
-    path = '%s?%s ' % (parsed.path, parsed.query)
-
-    return host, port, path
+    initial_song: bool = True
+    song_title: str = None
 
 
-def dump_stream(stream_url, size):
-    buffer = ByteFifo()
-    host, port, path = parse_url(stream_url)
+def retry_on_connection_timeout(retry_timeout: float):
+    def wrapper(fn):
+        @wraps(fn)
+        def inner(_self, *args, **kwargs):
+            try:
+                return fn(_self, *args, **kwargs)
+            except TimeoutError as e:
+                print(e, file=sys.stderr)
+                print("Retrying in %f" % retry_timeout)
+                sleep(retry_timeout)
+                # Drop buffers and everything. Restart the whole thing
+                inner(_self, *args, **kwargs)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((host, port))
-        sock.settimeout(6.0)
+        return inner
+
+    return wrapper
+
+
+class StreamRipper:
+
+    def __init__(self, stream_url, storage_dir):
+        self.stream_url = stream_url
+        self.storage_dir = storage_dir
+
+    @staticmethod
+    def parse_url(url) -> typing.Tuple[str, int, str]:
+        parsed = urlparse(url)
+
+        if ':' in parsed.netloc:
+            host, port = parsed.netloc.split(':')
+            port = int(port)
+        else:
+            host = parsed.netloc
+            port = 80
+
+        path = '%s?%s ' % (parsed.path, parsed.query)
+
+        return host, port, path
+
+    def dump_stream(self, size: int) -> bytearray:
+        buffer = ByteFifo()
+        host, port, path = self.parse_url(self.stream_url)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((host, port))
+            sock.settimeout(6.0)
+            sock.sendall(init_message % {b'host': host.encode('utf8'), b'path': path.encode('utf8')})
+
+            while len(buffer) < size:
+                buffer.put(sock.recv(CHUNK_SIZE))
+
+        return buffer.get(len(buffer))
+
+    def debug_stream(self, size: int):
+        dump = self.dump_stream(size)
+        header_idx = dump.find(b'\r\n\r\n') + 4
+        stream_idx = dump.find(b'StreamTitle') - 1
+        meta_len = dump[stream_idx] * 16
+        print("header_idx, stream_idx, stream_idx - header_idx, meta_len")
+        print(header_idx, stream_idx, stream_idx - header_idx, meta_len)
+
+    @retry_on_connection_timeout(retry_timeout=10.0)
+    def rip(self):
+        buffer = ByteFifo()
+        host, port, path = self.parse_url(self.stream_url)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((host, port))
+            sock.settimeout(5.0)
+
+            headers = self._get_headers(sock, buffer, host, path)
+            song_chunk_size = int(headers['icy-metaint'])
+
+            context = RipperContext(
+                song_store=BytesIO(),
+                song_bytes_to_read=song_chunk_size,
+                song_chunk_size=song_chunk_size,
+                content_type=headers['content-type']
+            )
+
+            while True:
+                if len(buffer) < BUFFER_SIZE:
+                    buffer.put(sock.recv(CHUNK_SIZE))
+
+                if len(buffer) < 512:  # Socket may provide any amount of data
+                    # Always have it somewhat filled so there would be no need to reiterate for metadata
+                    continue
+
+                if context.song_bytes_to_read > 0:
+                    self._fill_song_buffer(buffer, context)
+
+                elif context.song_bytes_to_read == 0:
+                    self._handle_metadata(buffer, context)
+
+                else:
+                    raise ShouldNeverHappenException('context.song_bytes_to_read < 0')
+
+    def _get_headers(self, sock: socket.socket, buffer: ByteFifo, host: str, path: str) -> dict:
         sock.sendall(init_message % {b'host': host.encode('utf8'), b'path': path.encode('utf8')})
 
-        while len(buffer) < size:
-            buffer.put(sock.recv(CHUNK_SIZE))
-
-    return buffer.get(len(buffer))
-
-
-def debug_stream(stream_url, size):
-    dump = dump_stream(stream_url, size)
-    header_idx = dump.find(b'\r\n\r\n') + 4
-    stream_idx = dump.find(b'StreamTitle') - 1
-    meta_len = dump[stream_idx] * 16
-    print("header_idx, stream_idx, stream_idx - header_idx, meta_len")
-    print(header_idx, stream_idx, stream_idx - header_idx, meta_len)
-
-
-def run(stream_url, song_store_dir='/home/rikkt0r/songs'):
-    # sock = socket.create_connection((host, port), timeout=5.0)
-
-    buffer = ByteFifo()
-    host, port, path = parse_url(stream_url)
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((host, port))
-        sock.settimeout(5.0)
-        sock.sendall(init_message % {b'host': host.encode('utf8'), b'path': path.encode('utf8')})
-
-        # Header and stuff
+        # Headers are typically shorter. Better act safe. Remaining buffer is a partial chunk of song
         while len(buffer) < 1024:
             buffer.put(sock.recv(CHUNK_SIZE))
 
@@ -90,73 +156,67 @@ def run(stream_url, song_store_dir='/home/rikkt0r/songs'):
 
         pprint(headers)
         print('-' * 120)
-        song_chunk_size = int(headers['icy-metaint'])
 
-        initial_song = True
-        song_store = BytesIO()
-        song_bytes_to_read = song_chunk_size
-        song_title = None
+        return headers
 
-        while True:
-            if len(buffer) < BUFFER_SIZE:
-                buffer.put(sock.recv(CHUNK_SIZE))
+    def _fill_song_buffer(self, buffer: ByteFifo, context: RipperContext):
+        chunk = buffer.get(context.song_bytes_to_read)
+        context.song_store.write(chunk)
+        context.song_bytes_to_read -= len(chunk)
 
-            if len(buffer) < 512:  # Socket may provide any amount of data
-                # Always have it somewhat filled so there would be no need to reiterate for metadata
+    def _handle_metadata(self, buffer: ByteFifo, context: RipperContext):
+        chunk = buffer.get(1)
+        if not chunk:
+            raise ShouldNeverHappenException('song_bytes_to_read == 0 ---> if not chunk')
+
+        elif chunk != b'\0':
+            current_title = self._get_metadata_title(chunk, buffer)
+            print("NOW RIPPIN':", current_title)
+
+            if context.song_title is None:
+                context.song_title = current_title
+
+            elif context.song_title != current_title:
+                # Time to write song to file
+                self._write_file(current_title, context)
+
+        context.song_bytes_to_read = context.song_chunk_size
+
+    def _get_metadata_title(self, initial_chunk: bytearray, buffer: ByteFifo) -> str:
+        metadata_to_read = ord(initial_chunk) * 16
+
+        if metadata_to_read > len(buffer):
+            raise ShouldNeverHappenException('metadata_to_read > len(buffer) (%d > %d)' % (
+                metadata_to_read, len(buffer)
+            ))
+
+        chunk = buffer.get(metadata_to_read)
+        metadata_to_read -= len(chunk)
+
+        meta = {}
+        # Strip doesn't work on bytearray. Workaround with slice
+        for meta_entry in chunk[:chunk.find(b'\0')].split(b';'):
+            if b'=' not in meta_entry:
                 continue
+            k, v = meta_entry.decode('utf8').split('=')
+            meta[k] = v.strip("'")
 
-            if song_bytes_to_read < 0:
-                raise ShouldNeverHappenException('song_bytes_to_read < 0')
+        return meta['StreamTitle']
 
-            if song_bytes_to_read > 0:
-                chunk = buffer.get(song_bytes_to_read)
-                song_store.write(chunk)
-                song_bytes_to_read -= len(chunk)
+    def _write_file(self, current_title: str, context: RipperContext):
+        ext = context.content_type.split('audio/')[1]  # possible bug?
+        file_name = '%s.%s' % (context.song_title, ext)
+        if context.initial_song:
+            context.initial_song = False
+            # When we begin rippin' it's almost certain that we don't have a full song
+            file_name = 'PARTIAL_%s' % file_name
+        context.song_title = current_title
 
-            elif song_bytes_to_read == 0:
-                chunk = buffer.get(1)
-                if not chunk:
-                    raise ShouldNeverHappenException('song_bytes_to_read == 0 ---> if not chunk')
-
-                elif chunk != b'\0':
-                    metadata_to_read = ord(chunk) * 16
-
-                    if metadata_to_read > len(buffer):
-                        raise ShouldNeverHappenException('metadata_to_read > len(buffer) (%d > %d)' % (
-                            metadata_to_read, len(buffer)
-                        ))
-
-                    chunk = buffer.get(metadata_to_read)
-                    metadata_to_read -= len(chunk)
-
-                    meta = {}
-                    # Strip doesn't work on bytearray
-                    for meta_entry in chunk[:chunk.find(b'\0')].split(b';'):
-                        if b'=' not in meta_entry:
-                            continue
-                        k, v = meta_entry.decode('utf8').split('=')
-                        meta[k] = v.strip("'")
-
-                    current_title = meta['StreamTitle']
-                    print("NOW RIPPIN':", current_title)
-                    if song_title is None:
-                        song_title = current_title
-                    elif song_title != current_title:
-                        # Time to write song to file
-                        ext = headers['content-type'].split('audio/')[1]
-                        file_name = '%s.%s' % (song_title, ext)
-                        if initial_song:
-                            initial_song = False
-                            file_name = 'PARTIAL_%s' % file_name
-                        song_title = current_title
-
-                        with open(os.path.join(song_store_dir, file_name), 'wb') as f:
-                            pos = song_store.tell()
-                            print("Song len in bytes", pos)
-                            song_store.seek(0)
-                            f.write(song_store.read(pos-song_chunk_size))  # metadata lags
-                            tmp = song_store.read()
-                            song_store = BytesIO()
-                            song_store.write(tmp)
-
-                song_bytes_to_read = song_chunk_size
+        with open(os.path.join(self.storage_dir, file_name), 'wb') as f:
+            pos = context.song_store.tell() - context.song_chunk_size  # metadata lags. silence detection needed
+            print("Song len: %d kB" % (pos // 1024))
+            context.song_store.seek(0)
+            f.write(context.song_store.read(pos))
+            tmp = context.song_store.read()
+            context.song_store = BytesIO()
+            context.song_store.write(tmp)

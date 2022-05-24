@@ -1,10 +1,10 @@
+import os
 import random
 import socket
-import os
 from unittest import TestCase, mock
+from unittest.mock import call
 
-from icyripper.ripper import run
-
+from icyripper.ripper import StreamRipper
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 tmp_dir = os.path.join(current_dir, '../..', 'tmp')
@@ -34,7 +34,7 @@ class MockSocket:
     def recv(self, size):
         if not len(self.content):
             raise EndOfStreamException('EOF!')
-        _size = random.randint(size//4, size//2)
+        _size = random.randint(size // 4, size // 2)
         data = self.content[:_size]
         self.content = self.content[_size:]
         return data
@@ -67,14 +67,26 @@ class MockSocket:
         return data
 
 
-class TestRipBin(TestCase):
+class TestRipper(TestCase):
     def setUp(self):
         try:
             os.mkdir(tmp_dir)
         except FileExistsError:
             pass
 
-    def test_bla(self):
+        self.ripper = StreamRipper('http://prem2.di.fm:80/chillntropicalhouse?insert_token_here', tmp_dir)
+
+    def test_debug(self):
         with mock.patch.object(socket, 'socket', mock.Mock(return_value=MockSocket())):
             with self.assertRaises(EndOfStreamException):
-                run('http://prem2.di.fm:80/chillntropicalhouse?insert_token_here', song_store_dir=tmp_dir)
+                self.ripper.rip()
+
+    def test_connection_retry(self):
+        with mock.patch.object(socket, 'socket', mock.Mock(return_value=MockSocket())):
+            with mock.patch.object(StreamRipper, '_get_headers', side_effect=[TimeoutError, EndOfStreamException]):
+                with mock.patch('icyripper.ripper.sleep', mock.Mock()) as sleep_mock:
+                    with self.assertRaises(EndOfStreamException):
+                        self.ripper.rip()
+
+                self.assertEqual(sleep_mock.call_count, 1)
+                self.assertEqual(sleep_mock.call_args, call(10.0, ))
