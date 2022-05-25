@@ -1,11 +1,11 @@
+import logging
 import os
 import socket
-import sys
 import typing
 from dataclasses import dataclass
 from functools import wraps
 from io import BytesIO
-from pprint import pprint
+from pprint import pformat
 from time import sleep
 from urllib.parse import urlparse
 
@@ -19,6 +19,8 @@ Host: %(host)s
 Icy-MetaData: 1
 
 """.replace(b'\n', b'\r\n')
+
+logger = logging.getLogger('icy.ripper')
 
 BUFFER_SIZE = 1024 * 16
 CHUNK_SIZE = 1024 * 4
@@ -46,8 +48,8 @@ def retry_on_connection_timeout(retry_timeout: float):
             try:
                 return fn(_self, *args, **kwargs)
             except TimeoutError as e:
-                print(e, file=sys.stderr)
-                print("Retrying in %f" % retry_timeout)
+                logger.exception(e)
+                logger.info("Retrying in %f", retry_timeout)
                 sleep(retry_timeout)
                 # Drop buffers and everything. Restart the whole thing
                 inner(_self, *args, **kwargs)
@@ -155,8 +157,7 @@ class StreamRipper:
                 if k == 'content-type' or k == 'server' or k.startswith('icy'):
                     headers[k] = "".join(v).strip()
 
-        pprint(headers)
-        print('-' * 120)
+        logger.debug(pformat(headers))
 
         return headers
 
@@ -172,7 +173,7 @@ class StreamRipper:
 
         elif chunk != b'\0':
             current_title = self._get_metadata_title(chunk, buffer)
-            print("NOW RIPPIN':", current_title)
+            logger.info("NOW RIPPIN': %s" % current_title)
 
             if context.song_title is None:
                 context.song_title = current_title
@@ -230,7 +231,7 @@ class StreamRipper:
 
         with open(os.path.join(self.storage_dir, filename), 'wb') as f:
             pos = context.song_store.tell() - context.song_chunk_size  # metadata lags. silence detection needed
-            print("Song len: %d kB" % (pos // 1024))
+            logger.debug("Song len: %d kB" % (pos // 1024))
             context.song_store.seek(0)
             f.write(context.song_store.read(pos))
             tmp = context.song_store.read()
