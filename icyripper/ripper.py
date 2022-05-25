@@ -59,9 +59,10 @@ def retry_on_connection_timeout(retry_timeout: float):
 
 class StreamRipper:
 
-    def __init__(self, stream_url, storage_dir):
+    def __init__(self, stream_url, storage_dir, skip_duplicates=False):
         self.stream_url = stream_url
         self.storage_dir = storage_dir
+        self.skip_duplicates = skip_duplicates
 
     @staticmethod
     def parse_url(url) -> typing.Tuple[str, int, str]:
@@ -204,15 +205,30 @@ class StreamRipper:
         return meta['StreamTitle']
 
     def _write_file(self, current_title: str, context: RipperContext):
-        ext = context.content_type.split('audio/')[1]  # possible bug?
-        file_name = '%s.%s' % (context.song_title, ext)
+        filename_without_ext = context.song_title
         if context.initial_song:
             context.initial_song = False
             # When we begin rippin' it's almost certain that we don't have a full song
-            file_name = 'PARTIAL_%s' % file_name
+            filename_without_ext = 'PARTIAL_%s' % filename_without_ext
+
+        ext = context.content_type.split('audio/')[1]  # possible bug?
+        filename = '%s.%s' % (filename_without_ext, ext)
+
+        def file_exists(_filename):
+            return os.path.exists(os.path.join(self.storage_dir, _filename))
+
+        if self.skip_duplicates and file_exists(filename):
+            context.song_store = BytesIO()
+            return
+
+        idx = 1
+        while file_exists(filename):
+            filename = '%s_%d.%s' % (filename_without_ext, idx, ext)
+            idx += 1
+
         context.song_title = current_title
 
-        with open(os.path.join(self.storage_dir, file_name), 'wb') as f:
+        with open(os.path.join(self.storage_dir, filename), 'wb') as f:
             pos = context.song_store.tell() - context.song_chunk_size  # metadata lags. silence detection needed
             print("Song len: %d kB" % (pos // 1024))
             context.song_store.seek(0)
